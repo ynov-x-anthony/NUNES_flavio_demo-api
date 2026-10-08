@@ -1,7 +1,7 @@
 'use strict';
 
 /*
- * demo-api - mini API "catalogue" pour le fil rouge des quetes Docker.
+ * demo-api - mini API "catalogue" pour le fil rouge des quetes Docker (modifie).
  * Metier volontairement trivial : toute la difficulte est sur Docker.
  *
  * Variables d'environnement :
