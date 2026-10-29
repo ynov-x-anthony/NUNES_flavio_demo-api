@@ -110,6 +110,29 @@ l'image) : seule l'API y accède, par le nom `db`.
  {"id":1,"name":"Sticker Demo","price_cents":150,"created_at":"2026-10-29T09:39:39.354Z"}]
 ```
 
+## Analyse de vulnérabilités (Trivy) et CI
+
+Scan local de l'image multi-étapes (sans installer Trivy) :
+
+```bash
+docker build -f api/Dockerfile.multi -t demo-api:multi ./api
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+  aquasec/trivy:latest image --severity HIGH,CRITICAL --ignore-unfixed demo-api:multi
+```
+
+| | Base | HIGH/CRITICAL |
+|---|---|---|
+| [scan-avant.txt](scan-avant.txt) | `node:22.11-alpine` (alpine 3.20.3) | **54** (49 HIGH, 5 CRITICAL) |
+| [scan-apres.txt](scan-apres.txt) | `node:22.23.4-alpine3.24` (alpine 3.24.3) | **0** |
+
+Corrections appliquées :
+
+- **OS** : base bumpée vers `node:22.23.4-alpine3.24` + `apk upgrade --no-cache` (21 CVE alpine → 0).
+- **Dépendances de l'app** : `npm audit fix` (`body-parser` 1.20.9, `proxy-addr` 2.0.8, `qs` 6.15.4/6.16.2), `package-lock.json` commité (2 CVE → 0).
+- **npm/npx/corepack supprimés de l'image finale** : inutiles à l'exécution (on ne lance que `node`), ils embarquaient 31 CVE.
+
+La CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) build `api/Dockerfile.multi` à chaque push (main et tags `v*`) puis lance `aquasecurity/trivy-action` avec `severity: CRITICAL,HIGH`, `ignore-unfixed: true` et `exit-code: '1'` : le job échoue dès qu'une CVE corrigeable réapparaît.
+
 ## Contenu du repo
 
 | Fichier | Rôle |
@@ -117,7 +140,10 @@ l'image) : seule l'API y accède, par le nom `db`.
 | `compose.yml` | la stack : `api`, `db`, `adminer`, volume `pgdata`, secret `db_password` |
 | `.env.example` | modèle des variables d'interpolation (à copier en `.env`) |
 | `api/Dockerfile` | image de l'API (utilisateur non-root, `HEALTHCHECK`) |
-| `api/Dockerfile.naive`, `api/Dockerfile.multi` | variantes naïve et multi-étapes |
+| `api/Dockerfile.naive` | variante naïve |
+| `api/Dockerfile.multi` | image multi-étapes, scannée par Trivy en CI |
+| `.github/workflows/ci.yml` | CI : build + gate Trivy HIGH/CRITICAL |
+| `scan-avant.txt`, `scan-apres.txt` | rapports Trivy avant / après correction |
 | `api/server.js` | l'API Express |
 | `api/db.js` | connexion PostgreSQL, pilotée par variables d'environnement (`PGPASSWORD_FILE` pour le secret) |
 | `db/init.sql` | création de la table `products` + données de démo |
