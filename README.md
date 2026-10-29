@@ -2,15 +2,16 @@
 
 Le fil rouge des quêtes Docker : une mini-API "catalogue" (`Node` + `Express`
 + `PostgreSQL`) conteneurisée, persistée, mise en réseau et orchestrée avec
-**Docker Compose**.
+**Docker Compose**, avec un second service métier indépendant (`notifier`).
 
-La stack contient 3 services :
+La stack contient 4 services :
 
-| Service | Image | Rôle | Exposé sur l'hôte |
-|---|---|---|---|
-| `api` | construite depuis `./api` | l'API Express | `http://localhost:8080` |
-| `db` | `postgres:16-alpine` | la base, données dans le volume `pgdata` | **non** (réseau interne uniquement) |
-| `adminer` | `adminer:4` | client SQL web | `http://localhost:8081` |
+| Service | Image | Rôle | Réseaux | Exposé sur l'hôte |
+|---|---|---|---|---|
+| `api` | `ghcr.io/ynov-x-anthony/nunes_flavio_demo-api/api` (build `./api`) | l'API Express | `front`, `back` | `http://localhost:8080` |
+| `notifier` | `ghcr.io/ynov-x-anthony/nunes_flavio_demo-api/notifier` (build `./notifier`) | reçoit un événement à chaque produit créé et logge une notification | `back` | **non** |
+| `db` | `postgres:16-alpine` | la base, données dans le volume `pgdata` | `back` | **non** |
+| `adminer` | `adminer:4` | client SQL web | `front`, `back` | `http://localhost:8081` |
 
 ## Prérequis
 
@@ -133,18 +134,84 @@ Corrections appliquées :
 
 La CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) build `api/Dockerfile.multi` à chaque push (main et tags `v*`) puis lance `aquasecurity/trivy-action` avec `severity: CRITICAL,HIGH`, `ignore-unfixed: true` et `exit-code: '1'` : le job échoue dès qu'une CVE corrigeable réapparaît.
 
+## Microservices : le service notifier
+
+`notifier` est un service à part entière : son propre dossier, son propre
+`package.json`, son propre `Dockerfile` (base épinglée, multi-étapes, `USER
+node`, `HEALTHCHECK`), sa propre image. Il expose `GET /health` et
+`POST /notify` (logge le corps reçu, répond `202`).
+
+Après chaque `POST /products` réussi, `api` appelle
+`http://notifier:4000/notify` : `notifier` est le **nom du service**, résolu
+par le DNS interne du réseau `back`. L'appel est **best-effort** : non
+attendu, avec un timeout de 2 s, il ne fait jamais échouer la requête.
+
+Vérification locale :
+
+```bash
+docker compose up -d --build
+curl -s -X POST localhost:8080/products -H "Content-Type: application/json" \
+  -d '{"name":"Clavier meca","price_cents":5900}'
+docker compose logs notifier | tail -5
+```
+
+```
+{"id":5,"name":"Clavier meca","price_cents":5900,"created_at":"2026-10-29T10:00:16.404Z"}
+notifier-1  | [notifier] started on port 4000
+notifier-1  | [notifier] nouveau produit : {"id":5,"name":"Clavier meca","price_cents":5900}
+```
+
+Panne de `notifier` (`docker compose stop notifier`) : `POST /products`
+répond toujours `201`, l'API logge simplement
+`{"level":"error","msg":"notify failed","err":"The operation was aborted due to timeout"}`.
+
+`notifier` n'a pas de `ports:` et n'est que sur `back` : un conteneur du
+réseau `front` ne le résout même pas (`nc: bad address 'notifier'`).
+
+## CI/CD : deux images publiées, puis déploiement
+
+[.github/workflows/ci.yml](.github/workflows/ci.yml) :
+
+- **job `image`** (matrix `service: [api, notifier]`) : chaque service est
+  buildé depuis son propre contexte, scanné par Trivy (`HIGH,CRITICAL`,
+  `ignore-unfixed`, gate `exit-code: 1` sur les tags `v*`), puis, sur un tag,
+  l'image scannée est poussée telle quelle sur
+  `ghcr.io/ynov-x-anthony/nunes_flavio_demo-api/<service>:<tag>`.
+- **job `deploy`** (`needs: image`, tags `v*` seulement) : `docker compose pull`
+  puis `docker compose up -d`, suivis d'un test de fumée (`/version`,
+  `POST /products`, notification reçue dans les logs de `notifier`).
+
+> **Déploiement simulé.** Faute de VM cible, le job `deploy` s'exécute sur le
+> runner GitHub lui-même (option prévue par l'énoncé). Il reproduit ce que
+> ferait le serveur : repo cloné, `.env` + secret créés, login GHCR,
+> `docker compose pull && docker compose up -d` sur les images du tag. Sur un
+> vrai serveur, les mêmes commandes passeraient par `appleboy/ssh-action`
+> (secrets `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`) :
+>
+> ```bash
+> cd /opt/demo-api && git pull
+> TAG=v1.5.0 docker compose pull && TAG=v1.5.0 docker compose up -d
+> docker image prune -f
+> ```
+
+Limites : Compose reste mono-hôte (`--scale notifier=3` ne dépasse pas la
+machine et ne répartit pas le trafic). Pour du multi-hôte, de l'auto-réparation
+sur un autre nœud ou des rolling updates : Docker Swarm
+(`docker stack deploy`) ou Kubernetes.
+
 ## Contenu du repo
 
 | Fichier | Rôle |
 |---|---|
-| `compose.yml` | la stack : `api`, `db`, `adminer`, volume `pgdata`, secret `db_password` |
+| `compose.yml` | la stack : `api`, `notifier`, `db`, `adminer`, réseaux `front`/`back`, volume `pgdata`, secret `db_password` |
 | `.env.example` | modèle des variables d'interpolation (à copier en `.env`) |
 | `api/Dockerfile` | image de l'API (utilisateur non-root, `HEALTHCHECK`) |
 | `api/Dockerfile.naive` | variante naïve |
 | `api/Dockerfile.multi` | image multi-étapes, scannée par Trivy en CI |
-| `.github/workflows/ci.yml` | CI : build + gate Trivy HIGH/CRITICAL |
+| `.github/workflows/ci.yml` | CI/CD : matrix `api`/`notifier` (build, scan, push GHCR) + `deploy` |
 | `scan-avant.txt`, `scan-apres.txt` | rapports Trivy avant / après correction |
-| `api/server.js` | l'API Express |
+| `api/server.js` | l'API Express (appelle `notifier` en best-effort) |
+| `notifier/` | second service : `server.js`, `package.json`, `Dockerfile` |
 | `api/db.js` | connexion PostgreSQL, pilotée par variables d'environnement (`PGPASSWORD_FILE` pour le secret) |
 | `db/init.sql` | création de la table `products` + données de démo |
 | `volumes_flavio_nunes.sh` | étape 2 : persistance avec un named volume |

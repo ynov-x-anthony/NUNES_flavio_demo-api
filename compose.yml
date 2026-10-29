@@ -1,17 +1,39 @@
+# En local : "docker compose up -d --build" construit les images.
+# En deploiement : "docker compose pull && docker compose up -d" recupere les
+# images publiees par la CI sur GHCR (IMAGE_PREFIX + TAG, cf. .env).
+
 services:
   api:
-    build: ./api
+    build:
+      context: ./api
+      dockerfile: Dockerfile.multi # meme Dockerfile que celui scanne en CI
+    image: ${IMAGE_PREFIX:-ghcr.io/ynov-x-anthony/nunes_flavio_demo-api}/api:${TAG:-latest}
     environment:
-      PGHOST: db # nom du service -> DNS interne du reseau du projet
+      PGHOST: db # nom du service -> DNS interne du reseau back
       PGUSER: ${POSTGRES_USER}
       PGDATABASE: ${POSTGRES_DB}
       PGPASSWORD_FILE: /run/secrets/db_password # mot de passe via Docker Secrets
+      NOTIFIER_HOST: notifier # nom du service -> DNS interne du reseau back
+      NOTIFIER_PORT: "4000"
+      VERSION: ${TAG:-dev}
     secrets: [db_password]
     ports:
       - "${API_PORT:-8080}:3000"
+    networks: [front, back]
     depends_on:
       db:
         condition: service_healthy
+    restart: unless-stopped
+
+  notifier:
+    build:
+      context: ./notifier
+    image: ${IMAGE_PREFIX:-ghcr.io/ynov-x-anthony/nunes_flavio_demo-api}/notifier:${TAG:-latest}
+    environment:
+      PORT: "4000"
+    # pas de ports: et reseau back uniquement : personne n'appelle notifier
+    # de l'exterieur, seule l'API lui parle.
+    networks: [back]
     restart: unless-stopped
 
   db:
@@ -24,7 +46,8 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    # pas de ports: -> la base n'est joignable que depuis le reseau du projet
+    # pas de ports: -> la base n'est joignable que depuis le reseau back
+    networks: [back]
     healthcheck:
       # -h localhost : pendant l'init, postgres n'ecoute que sur le socket
       # unix ; on attend le vrai serveur, joignable en TCP.
@@ -38,8 +61,13 @@ services:
     image: adminer:4
     ports:
       - "${ADMINER_PORT:-8081}:8080"
+    networks: [front, back] # back pour joindre db
     depends_on: [db]
     restart: unless-stopped
+
+networks:
+  front:
+  back:
 
 volumes:
   pgdata:
